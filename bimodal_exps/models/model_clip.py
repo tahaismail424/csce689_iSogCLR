@@ -103,6 +103,17 @@ class CLIP(nn.Module):
         else:
             raise NotImplementedError
 
+    def encode_image(self, images):
+        image_embeds = self.visual_encoder(images)
+        image_embeds = self.vision_proj(image_embeds)
+        image_feat = F.normalize(image_embeds, dim=-1) 
+        return image_feat
+
+    def encode_text(self, text):
+        text_output = self.text_encoder(text.input_ids, attention_mask=text.attention_mask, output_hidden_states=False)
+        text_embeds = self.text_proj(text_output.last_hidden_state[:,0,:])
+        text_feat = F.normalize(text_embeds, dim=-1) 
+        return text_feat
 
     def forward(self, image, text, idx, text_idx, epoch, max_epoch):
         if self.learnable_temp:
@@ -113,13 +124,8 @@ class CLIP(nn.Module):
                     self.image_temp.clamp_(0.001, 0.5)
                     self.text_temp.clamp_(0.001, 0.5)
         
-        image_embeds = self.visual_encoder(image)
-        image_embeds = self.vision_proj(image_embeds)
-        image_feat = F.normalize(image_embeds, dim=-1) 
-
-        text_output = self.text_encoder(text.input_ids, attention_mask=text.attention_mask, output_hidden_states=False)
-        text_embeds = self.text_proj(text_output.last_hidden_state[:,0,:])
-        text_feat = F.normalize(text_embeds, dim=-1)                 
+        image_embeds = image_feat = self.encode_image(image)
+        text_embeds = text_feat = self.encode_text(text)
 
         avg_image_tau = None
         avg_text_tau = None

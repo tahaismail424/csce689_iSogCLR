@@ -716,3 +716,11 @@ class onlineCLR_Loss(nn.Module):
 
 
 
+def sampled_anchor_clip_loss(image_features, text_features, anchor_ids, temperature=0.07):
+    image_to_text = image_features[anchor_ids] @ text_features.T / temperature
+    text_to_image = text_features[anchor_ids] @ image_features.T / temperature
+
+    image_loss = F.cross_entropy(image_to_text, anchor_ids)
+    text_loss = F.cross_entropy(text_to_image, anchor_ids)
+
+    return (image_loss + text_loss) / 2

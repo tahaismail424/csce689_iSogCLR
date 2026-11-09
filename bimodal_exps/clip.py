@@ -34,12 +34,109 @@ from dataset import create_train_dataset, create_val_dataset, create_sampler, cr
 from scheduler import create_scheduler
 from optim import create_optimizer
 from zeroshot_transfer.classes import CIFAR10_CLASSES, CIFAR100_CLASSES, IMAGENET_CLASSES
-
+from models.losses import sampled_anchor_clip_loss
 
 from tqdm import tqdm
 
+def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, temperature, anchor_ids):
+    model.train()
 
-def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, scheduler, grad_scaler, args):
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('lr_temp_net', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
+    metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('avg_image_tau', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('avg_text_tau', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('cur_eta', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('grad_tau_image', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('grad_tau_text', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('b_I', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('b_T', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('v', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('lamda', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('weights_image_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('weights_text_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+
+    header = 'Train Epoch: [{}]'.format(epoch)
+
+    print_freq = 50
+    step_size = 100
+
+    optimizer.zero_grad(set_to_none=True)
+    # cache embeddings 
+    image_chunks, text_chunks = [], []
+    with torch.no_grad():
+        for i,(image, text, idx, text_idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+            
+
+            image = image.to(device, non_blocking=True)   
+            idx = idx.to(device, non_blocking=True)
+            text_idx = text_idx.to(device, non_blocking=True)   
+            text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device)
+
+            # encode image and text features
+            image_feat = model.encode_image(image)
+            text_feat = model.encode_text(text_input)
+
+            # append to our embedding cache
+            image_chunks.append(image_feat)
+            text_chunks.append(text_feat)
+
+        image_embeds = torch.cat(image_chunks).requires_grad_()
+        text_embeds = torch.cat(text_chunks).requires_grad_()
+        del image_chunks, text_chunks
+
+        # differentialte loss w/ respect to whole embedding pool for our anchors
+        loss = sampled_anchor_clip_loss(image_embeds, text_embeds, anchor_ids, temperature)
+        image_grads, text_grads = torch.autograd.grad(loss, (image_embeds, text_embeds))
+
+        # backpropogate gradients for each minibatch
+        offset = 0
+        for i, (image, text, idx, text_idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+            image_feat = model.encode_image(image.to(device, non_blocking=True))
+            text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device)
+            text_feat = model.encode_text(text_input)
+            end = offset + len(image_feat)
+            torch.autograd.backward(
+                (image_feat, text_feat),
+                (image_grads[offset:end], text_grads[offset:end])
+            )
+            offset = end
+        optimizer.step()
+        metric_logger.update(loss_ita=loss.item())
+        return loss.item()
+        
+
+
+
+
+
+
+
+
+        
+
+    #metric_logger.update(avg_image_tau=info_dict['avg_image_tau'])
+    #metric_logger.update(avg_text_tau=info_dict['avg_text_tau'])
+    metric_logger.update(cur_eta=0.0)
+    metric_logger.update(grad_tau_image=0.0)
+    metric_logger.update(grad_tau_text=0.0)
+    metric_logger.update(weights_image_pos=0.0)
+    metric_logger.update(weights_text_pos=0.0)
+    metric_logger.update(b_I=0.0)
+    metric_logger.update(b_T=0.0)
+    metric_logger.update(v=0.0)
+    metric_logger.update(lamda=0.0)
+
+    metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+    metric_logger.update(lr_temp_net=optimizer.param_groups[2]["lr"])
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger.global_avg())     
+    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}  
+
+def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, device, scheduler, grad_scaler, args):
     # train
     model.train()
     
@@ -62,7 +159,6 @@ def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_ste
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50
     step_size = 100
-    warmup_iterations = warmup_steps*step_size  
 
     for i,(image, text, idx, text_idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         optimizer.zero_grad()
