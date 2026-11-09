@@ -39,7 +39,7 @@ from models.losses import sampled_anchor_clip_loss
 from tqdm import tqdm
 
 def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, temperature, anchor_ids):
-    model.train()
+    model.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -136,7 +136,7 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
     print("Averaged stats:", metric_logger.global_avg())     
     return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}  
 
-def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, device, scheduler, grad_scaler, args):
+def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, scheduler, grad_scaler, args):
     # train
     model.train()
     
@@ -159,6 +159,7 @@ def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, device, sc
     header = 'Train Epoch: [{}]'.format(epoch)
     print_freq = 50
     step_size = 100
+    warmup_iterations = warmup_steps*step_size  
 
     for i,(image, text, idx, text_idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         optimizer.zero_grad()
@@ -473,7 +474,10 @@ def main(args):
 
     #### Dataset #### 
     print("Creating retrieval dataset")
-    train_dataset = create_train_dataset('re', args)
+    if args.global_anchor:
+        train_dataset = create_train_dataset('re', args, seed=seed)
+    else:
+        train_dataset = create_train_dataset('re', args)
     # val_coco_dataset, test_coco_dataset = create_val_dataset('re', args, args.val_coco_file, args.coco_image_root, args.test_coco_file)
     val_coco_dataset = create_val_dataset('re', args, args.val_coco_file, args.coco_image_root, None)
     # val_flickr_dataset, test_flickr_dataset = create_val_dataset('re', args, args.val_flickr_file, args.flickr_image_root, args.test_flickr_file)
@@ -744,6 +748,7 @@ if __name__ == '__main__':
     parser.add_argument('--vision_width', default=768, type=int)
     parser.add_argument('--embed_dim', default=256, type=int)
     parser.add_argument('--global-anchor', action='store_false', type=bool)
+    parser.add_argument("--global-steps-per-epoch", type=int, default=1)
 
     # optimizer and schedular
     parser.add_argument('--opt', default='adamW')
