@@ -82,29 +82,29 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
             image_chunks.append(image_feat)
             text_chunks.append(text_feat)
 
-        image_embeds = torch.cat(image_chunks).requires_grad_()
-        text_embeds = torch.cat(text_chunks).requires_grad_()
-        del image_chunks, text_chunks
+    image_embeds = torch.cat(image_chunks).requires_grad_()
+    text_embeds = torch.cat(text_chunks).requires_grad_()
+    del image_chunks, text_chunks
 
-        # differentialte loss w/ respect to whole embedding pool for our anchors
-        loss = sampled_anchor_clip_loss(image_embeds, text_embeds, anchor_ids, temperature)
-        image_grads, text_grads = torch.autograd.grad(loss, (image_embeds, text_embeds))
+    # differentialte loss w/ respect to whole embedding pool for our anchors
+    loss = sampled_anchor_clip_loss(image_embeds, text_embeds, anchor_ids, temperature)
+    image_grads, text_grads = torch.autograd.grad(loss, (image_embeds, text_embeds))
 
-        # backpropogate gradients for each minibatch
-        offset = 0
-        for i, (image, text, idx, text_idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-            image_feat = model.encode_image(image.to(device, non_blocking=True))
-            text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device)
-            text_feat = model.encode_text(text_input)
-            end = offset + len(image_feat)
-            torch.autograd.backward(
-                (image_feat, text_feat),
-                (image_grads[offset:end], text_grads[offset:end])
-            )
-            offset = end
-        optimizer.step()
-        metric_logger.update(loss_ita=loss.item())
-        return loss.item()
+    # backpropogate gradients for each minibatch
+    offset = 0
+    for i, (image, text, idx, text_idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        image_feat = model.encode_image(image.to(device, non_blocking=True))
+        text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device)
+        text_feat = model.encode_text(text_input)
+        end = offset + len(image_feat)
+        torch.autograd.backward(
+            (image_feat, text_feat),
+            (image_grads[offset:end], text_grads[offset:end])
+        )
+        offset = end
+    optimizer.step()
+    metric_logger.update(loss_ita=loss.item())
+    return loss.item()
         
 
 
@@ -467,6 +467,9 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
     cudnn.benchmark = True
+    anchor_rng = np.random.default_rng(args.seed)
+    anchor_groups = iter(())
+
 
     #### Dataset #### 
     print("Creating retrieval dataset")
@@ -505,7 +508,11 @@ def main(args):
     else:
         samplers = [None, None, None]
 
-    train_loader = create_train_loader(train_dataset, samplers[0], args.batch_size_train, 2, None)
+    # use global deterministic loader for global anchor sampling
+    if args.global_anchor:
+        train_loader = create_train_loader(train_dataset, samplers[0], args.batch_size_train, 2, None, global_anchor=True)
+    else:
+        train_loader = create_train_loader(train_dataset, samplers[0], args.batch_size_train, 2, None)
 
     # val_coco_loader, test_coco_loader = create_val_loader([val_coco_dataset, test_coco_dataset], samplers[1:], 
     #                                                       [args.batch_size_test]*2, [8]*2, [None]*2)
@@ -514,6 +521,8 @@ def main(args):
     # val_flickr_loader, test_flickr_loader = create_val_loader([val_flickr_dataset, test_flickr_dataset], samplers[1:], 
     #                                                           [args.batch_size_test]*2, [8]*2, [None]*2)
     # sbu_loader= create_val_loader([sbu_dataset], [None], [args.batch_size_test], [32], [None])[0]
+
+    
        
     if args.text_encoder == 'roberta-large':
         tokenizer = RobertaTokenizer.from_pretrained(args.text_encoder)
@@ -588,6 +597,7 @@ def main(args):
     warmup_steps = args.warmup_epochs
     best = 0
     best_epoch = 0
+    
 
     print("Start training")
     start_time = time.time()    
@@ -595,8 +605,27 @@ def main(args):
         if not args.evaluate:
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)
-            train_stats = train(model, train_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, lr_scheduler, 
-                                grad_scaler, args)
+            if args.global_anchor:
+                losses = []
+                for _ in range(args.global_steps_per_epoch):
+                    group = next(anchor_groups, None)
+                    if group is None:
+                        order = anchor_rng.permutation(len(train_loader.dataset))
+                        anchor_groups = (
+                            order[start:start + 128] for start in range(0, len(order), 128)
+                        )
+                        group = next(anchor_groups)
+
+                    anchor_ids = torch.as_tensor(group, dtype=torch.long, device=device)
+                    losses.append(global_anchor_step(
+                        model, train_loader, optimizer, tokenizer,
+                        epoch, device, args.temp, anchor_ids,
+                    ))
+                avg_loss = np.mean(losses)
+                train_stats = {'loss_ita': avg_loss}
+            else:
+                train_stats = train(model, train_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, lr_scheduler, 
+                    grad_scaler, args)
             
         if args.evaluate:
             score_val_i2t_coco, score_val_t2i_coco = evaluation(model_without_ddp, val_coco_loader, tokenizer, device, args)
@@ -714,6 +743,7 @@ if __name__ == '__main__':
     parser.add_argument('--image_res', default=256, type=int)
     parser.add_argument('--vision_width', default=768, type=int)
     parser.add_argument('--embed_dim', default=256, type=int)
+    parser.add_argument('--global-anchor', action='store_false', type=bool)
 
     # optimizer and schedular
     parser.add_argument('--opt', default='adamW')
