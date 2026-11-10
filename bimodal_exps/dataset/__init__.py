@@ -7,20 +7,28 @@ from dataset.caption_dataset import re_train_dataset, re_eval_dataset
 from dataset.randaugment import RandomAugment
 
 
-def create_train_dataset(dataset, args, seed=None):
-    gen = torch.Generator() if seed else None
-
+def create_train_dataset(dataset, args, deterministic=False):
+    
     
     normalize = transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
-     
-    train_transform = transforms.Compose([                        
-            transforms.RandomResizedCrop(args.image_res, scale=(0.5, 1.0), interpolation=Image.BICUBIC, generator=gen),
-            transforms.RandomHorizontalFlip(generator=gen),
-            RandomAugment(2, 7, isPIL=True, augs=['Identity','AutoContrast','Equalize','Brightness','Sharpness',
-                                              'ShearX', 'ShearY', 'TranslateX', 'TranslateY', 'Rotate'], generator=gen),     
+    if deterministic:
+        train_transform = transforms.Compose([
+            transforms.Resize(
+                (args.image_res, args.image_res),
+                interpolation=Image.BICUBIC,
+            ),
             transforms.ToTensor(),
             normalize,
-        ]) 
+        ])
+    else:
+        train_transform = transforms.Compose([                        
+                transforms.RandomResizedCrop(args.image_res, scale=(0.5, 1.0), interpolation=Image.BICUBIC),
+                transforms.RandomHorizontalFlip(),
+                RandomAugment(2, 7, isPIL=True, augs=['Identity','AutoContrast','Equalize','Brightness','Sharpness',
+                                                'ShearX', 'ShearY', 'TranslateX', 'TranslateY', 'Rotate']),     
+                transforms.ToTensor(),
+                normalize,
+            ]) 
     
     if dataset=='re':   
         if gen:
@@ -69,7 +77,7 @@ def create_train_loader(dataset, sampler, batch_size, num_workers, collate_fn, g
                           sampler=sampler, shuffle=False, collate_fn=collate_fn, drop_last=False, prefetch_factor=4)
     else:
         return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
-            sampler=sampler, shuffle=(sampler is None), collate_fn=collate_fn, drop_last=True, prefetch_factor=4)              
+            sampler=None, shuffle=(sampler is None), collate_fn=collate_fn, drop_last=True, prefetch_factor=4)              
 
 
 def create_val_loader(datasets, samplers, batch_size, num_workers, collate_fns):

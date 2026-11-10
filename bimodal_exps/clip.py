@@ -42,21 +42,6 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
     model.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('lr_temp_net', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
-    metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('avg_image_tau', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('avg_text_tau', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('cur_eta', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('grad_tau_image', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('grad_tau_text', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('b_I', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('b_T', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('v', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('lamda', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('weights_image_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('weights_text_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-
     header = 'Train Epoch: [{}]'.format(epoch)
 
     print_freq = 50
@@ -103,38 +88,7 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
         )
         offset = end
     optimizer.step()
-    metric_logger.update(loss_ita=loss.item())
     return loss.item()
-        
-
-
-
-
-
-
-
-
-        
-
-    #metric_logger.update(avg_image_tau=info_dict['avg_image_tau'])
-    #metric_logger.update(avg_text_tau=info_dict['avg_text_tau'])
-    metric_logger.update(cur_eta=0.0)
-    metric_logger.update(grad_tau_image=0.0)
-    metric_logger.update(grad_tau_text=0.0)
-    metric_logger.update(weights_image_pos=0.0)
-    metric_logger.update(weights_text_pos=0.0)
-    metric_logger.update(b_I=0.0)
-    metric_logger.update(b_T=0.0)
-    metric_logger.update(v=0.0)
-    metric_logger.update(lamda=0.0)
-
-    metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-    metric_logger.update(lr_temp_net=optimizer.param_groups[2]["lr"])
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger.global_avg())     
-    return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}  
 
 def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, scheduler, grad_scaler, args):
     # train
@@ -451,9 +405,6 @@ def itm_eval(scores_i2t, scores_t2i, txt2img, img2txt):
                     'r_mean': r_mean}
     return eval_result
 
-
-
-
 def main(args):
     if args.distributed:
         utils.init_distributed_mode(args)    
@@ -474,10 +425,7 @@ def main(args):
 
     #### Dataset #### 
     print("Creating retrieval dataset")
-    if args.global_anchor:
-        train_dataset = create_train_dataset('re', args, seed=seed)
-    else:
-        train_dataset = create_train_dataset('re', args)
+    train_dataset = create_train_dataset('re', args, deterministic=args.global_anchor)
     # val_coco_dataset, test_coco_dataset = create_val_dataset('re', args, args.val_coco_file, args.coco_image_root, args.test_coco_file)
     val_coco_dataset = create_val_dataset('re', args, args.val_coco_file, args.coco_image_root, None)
     # val_flickr_dataset, test_flickr_dataset = create_val_dataset('re', args, args.val_flickr_file, args.flickr_image_root, args.test_flickr_file)
@@ -747,7 +695,7 @@ if __name__ == '__main__':
     parser.add_argument('--image_res', default=256, type=int)
     parser.add_argument('--vision_width', default=768, type=int)
     parser.add_argument('--embed_dim', default=256, type=int)
-    parser.add_argument('--global-anchor', action='store_false', type=bool)
+    parser.add_argument('--global-anchor', action='store_true', type=bool)
     parser.add_argument("--global-steps-per-epoch", type=int, default=1)
 
     # optimizer and schedular
