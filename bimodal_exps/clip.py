@@ -38,7 +38,7 @@ from models.losses import sampled_anchor_clip_loss
 
 from tqdm import tqdm
 
-def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, temperature, anchor_ids):
+def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, temperature, block_size=4096, reg_strength=1e-5):
     model.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -71,9 +71,22 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
     text_embeds = torch.cat(text_chunks).requires_grad_()
     del image_chunks, text_chunks
 
-    # differentialte loss w/ respect to whole embedding pool for our anchors
-    loss = sampled_anchor_clip_loss(image_embeds, text_embeds, anchor_ids, temperature)
-    image_grads, text_grads = torch.autograd.grad(loss, (image_embeds, text_embeds))
+    # differentialte loss w/ respect to whole embedding pool for each block
+    N = image_embeds.size(0)
+    total_loss = None
+    image_grads = torch.zeros_like(image_embeds); text_grads = torch.zeros_like(text_embeds)
+
+    for s in range(0, N, block_size):
+        a = torch.arange(s, min(s + block_size, N), device=device)
+        loss = sampled_anchor_clip_loss(image_embeds, text_embeds, a, temperature)
+        # add L2 regularization for lbfgs b/c no weight decay
+        gi, gt = torch.autograd.grad(loss * len(a) / N, (image_embeds, text_embeds))
+        image_grads += gi
+        text_grads += gt
+        if not total_loss:
+            total_loss = (loss * len(a) / N).detach()
+        else:
+            total_loss += (loss * len(a) / N).detach()
 
     # backpropogate gradients for each minibatch
     offset = 0
@@ -87,8 +100,13 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
             (image_grads[offset:end], text_grads[offset:end])
         )
         offset = end
-    optimizer.step()
-    return loss.item()
+    if isinstance(optimizer, torch.optim.LBFGS):
+        l2_norm = sum(p.pow(2).sum() for p in model.parameters() if p.requires_grad and p.ndim > 1) * 0.5 * reg_strength
+        l2_norm.backward()
+        total_loss += l2_norm.detach()
+
+
+    return total_loss
 
 def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, scheduler, grad_scaler, args):
     # train
@@ -419,6 +437,10 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
     cudnn.benchmark = True
+    if args.opt == 'lbfgs':
+        cudnn.benchmark = False
+        cudnn.deterministic = True
+        cudnn.allow_tf32 = False
     anchor_rng = np.random.default_rng(args.seed)
     anchor_groups = iter(())
 
@@ -462,9 +484,9 @@ def main(args):
 
     # use global deterministic loader for global anchor sampling
     if args.global_anchor:
-        train_loader = create_train_loader(train_dataset, samplers[0], args.batch_size_train, 2, None, global_anchor=True)
+        train_loader = create_train_loader(train_dataset, samplers[0], args.batch_size_train, args.num_workers, None, global_anchor=True)
     else:
-        train_loader = create_train_loader(train_dataset, samplers[0], args.batch_size_train, 2, None)
+        train_loader = create_train_loader(train_dataset, samplers[0], args.batch_size_train, args.num_workers, None)
 
     # val_coco_loader, test_coco_loader = create_val_loader([val_coco_dataset, test_coco_dataset], samplers[1:], 
     #                                                       [args.batch_size_test]*2, [8]*2, [None]*2)
@@ -498,7 +520,7 @@ def main(args):
 
     if args.evaluate or args.ita_type == 'isogclr_denoise':
         assert len(args.checkpoint) > 0
-        checkpoint = torch.load(args.checkpoint, map_location='cpu') 
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         state_dict = checkpoint['model']             
         model.load_state_dict(state_dict, strict=False)  
         print('load checkpoint from %s' % args.checkpoint)
@@ -532,8 +554,10 @@ def main(args):
 
         assert 0
 
-    optimizer = create_optimizer(args, model)
-    lr_scheduler, _ = create_scheduler(args, optimizer)
+    optimizer = create_optimizer(args, model) if args.opt != 'lbfgs' else torch.optim.LBFGS(model.parameters(), lr=1, max_iter=10, max_eval=15, history_size=10,
+                  line_search_fn="strong_wolfe")
+        
+    lr_scheduler, _ = create_scheduler(args, optimizer) if args.opt != 'lbfgs' else (None, None)
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
@@ -549,48 +573,49 @@ def main(args):
     warmup_steps = args.warmup_epochs
     best = 0
     best_epoch = 0
+    epoch = 0
     
 
     print("Start training")
     start_time = time.time()    
+    def closure():
+        optimizer.zero_grad()
+        return global_anchor_step(
+                    model, train_loader, optimizer, tokenizer,
+                    epoch, device, args.temp,
+                )
     for epoch in range(0, max_epoch):
         if not args.evaluate:
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)
             if args.global_anchor:
-                losses = []
-                for _ in range(args.global_steps_per_epoch):
-                    group = next(anchor_groups, None)
-                    if group is None:
-                        order = anchor_rng.permutation(len(train_loader.dataset))
-                        anchor_groups = (
-                            order[start:start + 128] for start in range(0, len(order), 128)
-                        )
-                        group = next(anchor_groups)
-
-                    anchor_ids = torch.as_tensor(group, dtype=torch.long, device=device)
-                    losses.append(global_anchor_step(
+                if args.opt != "lbfgs":
+                    loss = global_anchor_step(
                         model, train_loader, optimizer, tokenizer,
-                        epoch, device, args.temp, anchor_ids,
-                    ))
-                avg_loss = np.mean(losses)
+                        epoch, device, args.temp,
+                    )
+                    optimizer.step()
+                else:
+                    loss = optimizer.step(closure)
+
+                avg_loss = np.mean(loss.item())
                 train_stats = {'loss_ita': avg_loss}
             else:
                 train_stats = train(model, train_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, lr_scheduler, 
                     grad_scaler, args)
             
-        if args.evaluate:
-            score_val_i2t_coco, score_val_t2i_coco = evaluation(model_without_ddp, val_coco_loader, tokenizer, device, args)
-            # score_test_i2t_coco, score_test_t2i_coco = evaluation(model_without_ddp, test_coco_loader, tokenizer, device, args)
-
-            # score_val_i2t_flickr, score_val_t2i_flickr = evaluation(model_without_ddp, val_flickr_loader, tokenizer, device, args)
-            # score_test_i2t_flickr, score_test_t2i_flickr = evaluation(model_without_ddp, test_flickr_loader, tokenizer, device, args)
+        # COCO retrieval val runs every epoch (training and --evaluate)
+        score_val_i2t_coco, score_val_t2i_coco = evaluation(model_without_ddp, val_coco_loader, tokenizer, device, args)
+        # score_test_i2t_coco, score_test_t2i_coco = evaluation(model_without_ddp, test_coco_loader, tokenizer, device, args)
+        # score_val_i2t_flickr, score_val_t2i_flickr = evaluation(model_without_ddp, val_flickr_loader, tokenizer, device, args)
+        # score_test_i2t_flickr, score_test_t2i_flickr = evaluation(model_without_ddp, test_flickr_loader, tokenizer, device, args)
     
         if utils.is_main_process():  
 
+            val_result_coco = itm_eval(score_val_i2t_coco, score_val_t2i_coco, val_coco_loader.dataset.txt2img, val_coco_loader.dataset.img2txt)
+            print("coco val:", val_result_coco)
+
             if args.evaluate:
-                val_result_coco = itm_eval(score_val_i2t_coco, score_val_t2i_coco, val_coco_loader.dataset.txt2img, val_coco_loader.dataset.img2txt)  
-                print("coco val:", val_result_coco)
                 # test_result_coco = itm_eval(score_test_i2t_coco, score_test_t2i_coco, test_coco_loader.dataset.txt2img, test_coco_loader.dataset.img2txt)    
                 # print("coco test:", test_result_coco)
 
@@ -637,35 +662,41 @@ def main(args):
 
             else:
                 log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                            #  **{f'val_{k}': v for k, v in val_result_coco.items()},
-                             # **{f'test_{k}': v for k, v in test_result_coco.items()},                  
+                             **{f'val_{k}': v for k, v in val_result_coco.items()},
+                             #**{f'test_{k}': v for k, v in test_result_coco.items()},                  
                              'epoch': epoch,
                              'data': 'coco',
                             }
                 with open(os.path.join(args.output_dir, "coco_log.txt"),"a") as f:
                     f.write(json.dumps(log_stats) + "\n")
 
-                # if val_result_coco['r_mean'] > best:
-                #     save_obj = {
-                #         'model': model_without_ddp.state_dict(),
-                #         'optimizer': optimizer.state_dict(),
-                #         'lr_scheduler': lr_scheduler.state_dict(),
-                #         'args': args,
-                #         'epoch': epoch,
-                #     }
-                #     torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_best.pth'))  
-                #     best = val_result_coco['r_mean']    
-                #     best_epoch = epoch
+                if val_result_coco['r_mean'] > best:
+                    save_obj = {
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict() if args.opt != 'lbfgs' else None,
+                        'args': args,
+                        'epoch': epoch,
+                    }
+                    torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_best.pth'))  
+                    best = val_result_coco['r_mean']    
+                    best_epoch = epoch
 
-                save_obj = {
-                    'model': model_without_ddp.state_dict()
-                }
-                torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_'+str(epoch+1)+'.pth'))
+                if (epoch + 1) % args.save_freq == 0:
+                    save_obj = {
+                        'model': model_without_ddp.state_dict()
+                    }
+                    torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_'+str(epoch+1)+'.pth'))
                     
         if args.evaluate: 
             break
-           
-        lr_scheduler.step(epoch+warmup_steps+1)  
+        
+        if args.global_anchor and args.opt != 'lbfgs':
+            lr_scheduler.step(epoch+1)  
+        elif args.opt != 'lbfgs':
+            lr_scheduler.step(epoch+warmup_steps+1)  
+
+
         if args.distributed:
             dist.barrier()     
         torch.cuda.empty_cache()
@@ -695,8 +726,7 @@ if __name__ == '__main__':
     parser.add_argument('--image_res', default=256, type=int)
     parser.add_argument('--vision_width', default=768, type=int)
     parser.add_argument('--embed_dim', default=256, type=int)
-    parser.add_argument('--global-anchor', action='store_true', type=bool)
-    parser.add_argument("--global-steps-per-epoch", type=int, default=1)
+    parser.add_argument('--global-anchor', action='store_true')
 
     # optimizer and schedular
     parser.add_argument('--opt', default='adamW')
@@ -713,9 +743,12 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', default=30, type=int)
     parser.add_argument('--warmup_epochs', default=5, type=int)
     parser.add_argument('--cooldown_epochs', default=0, type=int)
+    parser.add_argument('--save-freq', default=10, type=int)
+
 
     # training & test settings
     parser.add_argument('--use_amp', action='store_true')
+    parser.add_argument('--num-workers', default=8, type=int)
     parser.add_argument('--init_model', action='store_true')
     parser.add_argument('--batch_size_train', default=128, type=int)
     parser.add_argument('--batch_size_test', default=128, type=int)

@@ -30,9 +30,7 @@ def create_train_dataset(dataset, args, deterministic=False):
                 normalize,
             ]) 
     
-    if dataset=='re':   
-        if gen:
-            gen.manual_seed(seed)       
+    if dataset=='re':        
         train_dataset = re_train_dataset([args.train_file], train_transform, args.train_image_root)          
         return train_dataset
 
