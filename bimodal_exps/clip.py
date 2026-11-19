@@ -34,12 +34,40 @@ from dataset import create_train_dataset, create_val_dataset, create_sampler, cr
 from scheduler import create_scheduler
 from optim import create_optimizer
 from zeroshot_transfer.classes import CIFAR10_CLASSES, CIFAR100_CLASSES, IMAGENET_CLASSES
-from models.losses import sampled_anchor_clip_loss
+from models.losses import sampled_anchor_clip_loss, memory_bank_clip_loss
 
 from tqdm import tqdm
 
-def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, temperature, block_size=4096, reg_strength=1e-5):
+
+# ---- logging helpers (debug/diagnostics only; no effect on training) ----
+def _grad_norms(model):
+    """L2 norm of p.grad overall and per module group."""
+    groups = {'image_enc': 0.0, 'text_enc': 0.0, 'proj': 0.0, 'other': 0.0}
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        sq = p.grad.detach().float().pow(2).sum().item()
+        if name.startswith('visual_encoder'):
+            groups['image_enc'] += sq
+        elif name.startswith('text_encoder'):
+            groups['text_enc'] += sq
+        elif name.startswith(('vision_proj', 'text_proj')):
+            groups['proj'] += sq
+        else:
+            groups['other'] += sq
+    out = {f'grad_norm_{k}': v ** 0.5 for k, v in groups.items() if k != 'other' or v > 0}
+    out['grad_norm'] = sum(groups.values()) ** 0.5
+    return out
+
+
+def _flat_params(model):
+    return torch.nn.utils.parameters_to_vector([p.detach() for p in model.parameters()]).clone()
+
+
+def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, temperature, block_size=4096, reg_strength=1e-5, stats=None):
+    """If `stats` is a dict, it is filled with timing / loss-part / grad-norm diagnostics."""
     model.eval()
+    t_start = time.time()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Train Epoch: [{}]'.format(epoch)
@@ -70,6 +98,8 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
     image_embeds = torch.cat(image_chunks).requires_grad_()
     text_embeds = torch.cat(text_chunks).requires_grad_()
     del image_chunks, text_chunks
+    torch.cuda.synchronize()
+    t_pass1 = time.time()
 
     # differentialte loss w/ respect to whole embedding pool for each block
     N = image_embeds.size(0)
@@ -87,6 +117,9 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
             total_loss = (loss * len(a) / N).detach()
         else:
             total_loss += (loss * len(a) / N).detach()
+    torch.cuda.synchronize()
+    t_loss = time.time()
+    contrastive_loss = total_loss.item()
 
     # backpropogate gradients for each minibatch
     offset = 0
@@ -100,13 +133,177 @@ def global_anchor_step(model, data_loader, optimizer, tokenizer, epoch, device, 
             (image_grads[offset:end], text_grads[offset:end])
         )
         offset = end
+    torch.cuda.synchronize()
+    t_pass2 = time.time()
+    l2_value = 0.0
     if isinstance(optimizer, torch.optim.LBFGS):
         l2_norm = sum(p.pow(2).sum() for p in model.parameters() if p.requires_grad and p.ndim > 1) * 0.5 * reg_strength
         l2_norm.backward()
         total_loss += l2_norm.detach()
+        l2_value = l2_norm.item()
 
+    if stats is not None:
+        stats.update({
+            'loss_contrastive': contrastive_loss,
+            'loss_l2': l2_value,
+            'loss_total': total_loss.item(),
+            'time_pass1_s': t_pass1 - t_start,
+            'time_loss_s': t_loss - t_pass1,
+            'time_pass2_s': t_pass2 - t_loss,
+        })
+        stats.update(_grad_norms(model))
 
     return total_loss
+
+def build_bank(model, refresh_loader, N, device, tokenizer):
+    model.eval()
+    img_bank = torch.zeros(N, 256, device=device)
+    txt_bank = torch.zeros(N, 256, device=device)
+    with torch.no_grad():
+        for i,(image, text, idx, text_idx) in enumerate(refresh_loader):
+            image = image.to(device, non_blocking=True)   
+            idx = idx.to(device, non_blocking=True)
+            text_idx = text_idx.to(device, non_blocking=True)   
+            text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device)
+
+            # encode image and text features
+            image_feat = model.encode_image(image)
+            text_feat = model.encode_text(text_input)
+
+            # add to bank
+            img_bank[text_idx] = image_feat
+            txt_bank[text_idx] = text_feat
+    model.train()
+    return img_bank, txt_bank
+
+def bank_train_epoch(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, scheduler, grad_scaler, refresh_loader, step_counter, img_bank, txt_bank, args):
+    # train
+    model.train()
+    
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('lr_temp_net', utils.SmoothedValue(window_size=1, fmt='{value:.8f}'))
+    metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('cur_eta', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('grad_tau_image', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('grad_tau_text', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('b_I', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('b_T', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('v', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('lamda', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('weights_image_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('weights_text_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+
+
+    header = 'Train Epoch: [{}]'.format(epoch)
+    print_freq = 50
+    step_size = 100
+    warmup_iterations = warmup_steps*step_size  
+    n_refreshes = 0
+    bank_drift_img = []
+    bank_drift_txt = []
+    refresh_times = []
+
+    # compute bank if args say to at beginning of epoch
+    if epoch != 0 and args.bank_refresh_steps == 0:
+        time_start = time.time()
+        new_img_bank, new_txt_bank = build_bank(model, refresh_loader, len(img_bank), device, tokenizer)
+        torch.cuda.synchronize()
+        time_refresh = time.time()
+
+        # compute cosine distances between banks
+        img_drift = torch.einsum("ij,ij->i", img_bank, new_img_bank).mean()
+        txt_drift = torch.einsum("ij,ij->i", txt_bank, new_txt_bank).mean()
+        n_refreshes += 1
+        bank_drift_img.append(img_drift.item())
+        bank_drift_txt.append(txt_drift.item())
+        refresh_times.append(time_refresh - time_start)
+
+        # copy banks in place
+        img_bank.copy_(new_img_bank)
+        txt_bank.copy_(new_txt_bank)
+
+    for i,(image, text, idx, text_idx) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        optimizer.zero_grad()
+
+        image = image.to(device, non_blocking=True)   
+        idx = idx.to(device, non_blocking=True)
+        text_idx = text_idx.to(device, non_blocking=True)   
+        text_input = tokenizer(text, padding='max_length', truncation=True, max_length=30, return_tensors="pt").to(device)
+        
+        # set learning rate for temperature network
+        optimizer.param_groups[2]["lr"] = optimizer.param_groups[0]["lr"] / 10.0
+
+        if grad_scaler is None:
+            img_feat = model.encode_image(image)
+            txt_feat = model.encode_text(text_input)
+            loss_ita = memory_bank_clip_loss(img_feat, txt_feat, text_idx, img_bank, txt_bank, args.temp)
+            loss_ita.backward()
+            optimizer.step()
+        else:
+            with torch.cuda.amp.autocast():
+                img_feat = model.encode_image(image)
+                txt_feat = model.encode_text(text_input)
+                loss_ita = memory_bank_clip_loss(img_feat, txt_feat, text_idx, img_bank, txt_bank, args.temp)
+            grad_scaler.scale(loss_ita).backward()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+
+        # update bank
+        img_bank[text_idx] = img_feat.detach().float()
+        txt_bank[text_idx] = txt_feat.detach().float()
+
+        # count steps
+        step_counter += 1
+
+        # if step counter has reached refresh steps, recompute the whole bank
+        if args.bank_refresh_steps > 0 and step_counter == args.bank_refresh_steps:
+            time_start = time.time()
+            new_img_bank, new_txt_bank = build_bank(model, refresh_loader, len(img_bank), device, tokenizer)
+            torch.cuda.synchronize()
+            time_refresh = time.time()
+            # compute cosine distances between banks
+            img_drift = torch.einsum("ij,ij->i", img_bank, new_img_bank).mean()
+            txt_drift = torch.einsum("ij,ij->i", txt_bank, new_txt_bank).mean()
+            n_refreshes += 1
+            bank_drift_img.append(img_drift.item())
+            bank_drift_txt.append(txt_drift.item())
+            refresh_times.append(time_refresh - time_start)
+
+            # copy banks in place
+            img_bank.copy_(new_img_bank)
+            txt_bank.copy_(new_txt_bank)
+            step_counter = 0
+        
+        metric_logger.update(loss_ita=loss_ita.item())
+
+        # metric_logger.update(avg_image_tau=info_dict['avg_image_tau'])
+        # metric_logger.update(avg_text_tau=info_dict['avg_text_tau'])
+        metric_logger.update(cur_eta=0.0)
+        metric_logger.update(grad_tau_image=0.0)
+        metric_logger.update(grad_tau_text=0.0)
+        metric_logger.update(weights_image_pos=0.0)
+        metric_logger.update(weights_text_pos=0.0)
+        metric_logger.update(b_I=0.0)
+        metric_logger.update(b_T=0.0)
+        metric_logger.update(v=0.0)
+        metric_logger.update(lamda=0.0)
+
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        metric_logger.update(lr_temp_net=optimizer.param_groups[2]["lr"])
+        if epoch==0 and i%step_size==0 and i<=warmup_iterations and scheduler is not None: 
+            scheduler.step(i//step_size)
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger.global_avg())     
+    train_stats = {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}
+    # add additional train stats
+    train_stats['n_refreshes'] = n_refreshes
+    train_stats['bank_drift_img'] = bank_drift_img
+    train_stats['bank_drift_txt'] = bank_drift_txt
+    train_stats['refresh_times'] = refresh_times
+    return train_stats, step_counter
 
 def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, scheduler, grad_scaler, args):
     # train
@@ -118,12 +315,9 @@ def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_ste
     metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('avg_image_tau', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('avg_text_tau', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('cur_eta', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('grad_tau_image', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('grad_tau_text', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('b_I', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('b_T', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
-    metric_logger.add_meter('v', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('lamda', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('weights_image_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     metric_logger.add_meter('weights_text_pos', utils.SmoothedValue(window_size=1, fmt='{value:.4f}'))
@@ -215,7 +409,6 @@ def train(model, data_loader, optimizer, tokenizer, epoch, max_epoch, warmup_ste
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger.global_avg())     
     return {k: "{:.3f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}  
-
 
 """
     zero-shot transfer
@@ -424,6 +617,7 @@ def itm_eval(scores_i2t, scores_t2i, txt2img, img2txt):
     return eval_result
 
 def main(args):
+    assert not (args.memory_bank and args.global_anchor), "can only have one of memory bank or global anchor true"
     if args.distributed:
         utils.init_distributed_mode(args)    
     else:
@@ -577,43 +771,100 @@ def main(args):
     
 
     print("Start training")
-    start_time = time.time()    
+    start_time = time.time()
+    train_time_cum = 0.0      # seconds spent in training steps only (excludes val/ckpt)
+    closure_evals = []        # per-closure-call diagnostics for the current epoch (LBFGS)
     def closure():
         optimizer.zero_grad()
-        return global_anchor_step(
+        ev_stats = {}
+        out = global_anchor_step(
                     model, train_loader, optimizer, tokenizer,
-                    epoch, device, args.temp,
+                    epoch, device, args.temp, stats=ev_stats,
                 )
+        closure_evals.append(ev_stats)
+        return out
+    # create necessary objs for memory bank
+    if args.memory_bank:
+        step_counter = 0
+        refresh_set = create_train_dataset('re', args, deterministic=True)
+        refresh_set = Subset(refresh_set, list(range(num_training)))
+        refresh_loader = create_train_loader(refresh_set, None, 256, args.num_workers, None, global_anchor=True)
+        img_bank, txt_bank = build_bank(model, refresh_loader, len(refresh_set), device, tokenizer)
+
     for epoch in range(0, max_epoch):
         if not args.evaluate:
             if args.distributed:
                 train_loader.sampler.set_epoch(epoch)
+            torch.cuda.reset_peak_memory_stats()
+            t_epoch = time.time()
             if args.global_anchor:
+                closure_evals.clear()
+                params_before = _flat_params(model_without_ddp)
                 if args.opt != "lbfgs":
+                    step_stats = {}
                     loss = global_anchor_step(
                         model, train_loader, optimizer, tokenizer,
-                        epoch, device, args.temp,
+                        epoch, device, args.temp, stats=step_stats,
                     )
                     optimizer.step()
                 else:
                     loss = optimizer.step(closure)
+                    step_stats = dict(closure_evals[0]) if closure_evals else {}
 
-                avg_loss = np.mean(loss.item())
-                train_stats = {'loss_ita': avg_loss}
+                params_after = _flat_params(model_without_ddp)
+                update_norm = (params_after - params_before).norm().item()
+                param_norm = params_before.norm().item()
+                del params_before, params_after
+
+                train_stats = {'loss_ita': loss.item()}
+                train_stats.update(step_stats)
+                train_stats['update_norm'] = update_norm
+                train_stats['param_norm'] = param_norm
+                train_stats['update_ratio'] = update_norm / max(param_norm, 1e-12)
+                if args.opt != 'lbfgs':
+                    for gi, g in enumerate(optimizer.param_groups):
+                        if len(g['params']):
+                            train_stats[f'lr_group{gi}'] = g['lr']
+                    train_stats['full_passes_cum'] = epoch + 1
+                else:
+                    st = optimizer.state[optimizer._params[0]]
+                    train_stats['lbfgs_func_evals_cum'] = st.get('func_evals', 0)
+                    train_stats['lbfgs_n_iter_cum'] = st.get('n_iter', 0)
+                    train_stats['lbfgs_t'] = float(st['t']) if 't' in st else None
+                    train_stats['lbfgs_evals_this_step'] = len(closure_evals)
+                    train_stats['grad_norm_per_eval'] = [e.get('grad_norm') for e in closure_evals]
+                    train_stats['loss_per_eval'] = [e.get('loss_total') for e in closure_evals]
+                    train_stats['full_passes_cum'] = st.get('func_evals', 0)
+            elif args.memory_bank:
+                train_stats, step_counter = bank_train_epoch(model, train_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, lr_scheduler,
+                    grad_scaler, refresh_loader, step_counter, img_bank, txt_bank, args)
+                train_stats['full_passes_cum'] = epoch + 1
             else:
-                train_stats = train(model, train_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, lr_scheduler, 
+                train_stats = train(model, train_loader, optimizer, tokenizer, epoch, max_epoch, warmup_steps, device, lr_scheduler,
                     grad_scaler, args)
+                train_stats['full_passes_cum'] = epoch + 1
+            torch.cuda.synchronize()
+            train_time_cum += time.time() - t_epoch
+            train_stats['train_time_cum_s'] = train_time_cum
+            train_stats['wall_time_s'] = time.time() - start_time
+            train_stats['peak_mem_gb'] = torch.cuda.max_memory_allocated() / 1e9
+            print(f"[epoch {epoch}] " + json.dumps({k: v for k, v in train_stats.items() if not isinstance(v, list)}))
             
-        # COCO retrieval val runs every epoch (training and --evaluate)
-        score_val_i2t_coco, score_val_t2i_coco = evaluation(model_without_ddp, val_coco_loader, tokenizer, device, args)
+        # COCO retrieval val: every --eval_freq epochs (and always on the last epoch / --evaluate)
+        do_eval = args.evaluate or (epoch + 1) % args.eval_freq == 0 or epoch == max_epoch - 1
+        if do_eval:
+            score_val_i2t_coco, score_val_t2i_coco = evaluation(model_without_ddp, val_coco_loader, tokenizer, device, args)
         # score_test_i2t_coco, score_test_t2i_coco = evaluation(model_without_ddp, test_coco_loader, tokenizer, device, args)
         # score_val_i2t_flickr, score_val_t2i_flickr = evaluation(model_without_ddp, val_flickr_loader, tokenizer, device, args)
         # score_test_i2t_flickr, score_test_t2i_flickr = evaluation(model_without_ddp, test_flickr_loader, tokenizer, device, args)
     
         if utils.is_main_process():  
 
-            val_result_coco = itm_eval(score_val_i2t_coco, score_val_t2i_coco, val_coco_loader.dataset.txt2img, val_coco_loader.dataset.img2txt)
-            print("coco val:", val_result_coco)
+            if do_eval:
+                val_result_coco = itm_eval(score_val_i2t_coco, score_val_t2i_coco, val_coco_loader.dataset.txt2img, val_coco_loader.dataset.img2txt)
+                print("coco val:", val_result_coco)
+            else:
+                val_result_coco = {}
 
             if args.evaluate:
                 # test_result_coco = itm_eval(score_test_i2t_coco, score_test_t2i_coco, test_coco_loader.dataset.txt2img, test_coco_loader.dataset.img2txt)    
@@ -670,10 +921,11 @@ def main(args):
                 with open(os.path.join(args.output_dir, "coco_log.txt"),"a") as f:
                     f.write(json.dumps(log_stats) + "\n")
 
-                if val_result_coco['r_mean'] > best:
+                if do_eval and val_result_coco['r_mean'] > best:
                     save_obj = {
                         'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
+                        # LBFGS history is ~7GB; only keep optimizer state for Adam-style optimizers
+                        'optimizer': optimizer.state_dict() if args.opt != 'lbfgs' else None,
                         'lr_scheduler': lr_scheduler.state_dict() if args.opt != 'lbfgs' else None,
                         'args': args,
                         'epoch': epoch,
@@ -727,9 +979,11 @@ if __name__ == '__main__':
     parser.add_argument('--vision_width', default=768, type=int)
     parser.add_argument('--embed_dim', default=256, type=int)
     parser.add_argument('--global-anchor', action='store_true')
+    parser.add_argument('--memory-bank', action='store_true')
 
     # optimizer and schedular
     parser.add_argument('--opt', default='adamW')
+    parser.add_argument('--opt_betas', default=None, type=float, nargs=2, help='Adam/AdamW betas, e.g. 0.9 0.95')
     parser.add_argument('--sched', default='cosine')
     parser.add_argument('--lr', default=2e-4, type=float)
     parser.add_argument('--lr_temp_net', default=1e-6, type=float)
@@ -744,6 +998,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_epochs', default=5, type=int)
     parser.add_argument('--cooldown_epochs', default=0, type=int)
     parser.add_argument('--save-freq', default=10, type=int)
+    parser.add_argument('--eval_freq', default=1, type=int, help='run COCO val every N epochs')
 
 
     # training & test settings
@@ -761,6 +1016,7 @@ if __name__ == '__main__':
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', action='store_true')
     parser.add_argument('--no-distributed', dest='distributed', action='store_false')
+    parser.add_argument('--bank-refresh-steps', default=0, type=int)
 
     # output path
     parser.add_argument('--output_dir', default='./output/clip_test')  

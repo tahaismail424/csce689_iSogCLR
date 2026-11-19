@@ -714,8 +714,6 @@ class onlineCLR_Loss(nn.Module):
 
         return loss
 
-
-
 def sampled_anchor_clip_loss(image_features, text_features, anchor_ids, temperature=0.07):
     image_to_text = image_features[anchor_ids] @ text_features.T / temperature
     text_to_image = text_features[anchor_ids] @ image_features.T / temperature
@@ -724,3 +722,21 @@ def sampled_anchor_clip_loss(image_features, text_features, anchor_ids, temperat
     text_loss = F.cross_entropy(text_to_image, anchor_ids)
 
     return (image_loss + text_loss) / 2
+
+@torch.amp.autocast("cuda", enabled=False)
+def memory_bank_clip_loss(img_fresh, txt_fresh, rows, img_bank, txt_bank, temperature):
+    # ensure fp32 tensors
+    img_fresh = img_fresh.float()
+    txt_fresh = txt_fresh.float()
+    
+    # copy new embeddings into bank
+    txt_update = txt_bank.index_copy(0, rows, txt_fresh)
+    img_update = img_bank.index_copy(0, rows, img_fresh)
+
+    sims_to_text = img_fresh @ txt_update.T / temperature
+    sims_to_img = txt_fresh @  img_update.T / temperature
+
+    image_loss = F.cross_entropy(sims_to_text, rows)
+    text_loss = F.cross_entropy(sims_to_img, rows)
+    return (image_loss + text_loss) / 2
+
